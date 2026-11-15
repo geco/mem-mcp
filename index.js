@@ -1,0 +1,656 @@
+#!/usr/bin/env node
+/**
+ * memory-agent-mcp — MCP stdio server for Memory01 agentic memory service
+ *
+ * Provides tools to interact with the Memory01 API:
+ *   - store(agentId, key, value, writeToken?, sessionId?, metadata?, base?) -> Store a memory (free; base=true for 2KB contextual memories)
+ *   - search(agentId, query, writeToken, topK?, sessionId?, cursor?, includeBase?) -> Search memories (free tier 30/day, then $0.01)
+ *   - bootstrap(agentId, writeToken, keys?) -> Initialize conventional base memories (free, idempotent)
+ *   - get(agentId, writeToken, key) -> Retrieve a single memory by key (free)
+ *   - recover(agentId, recoveryCode) -> Recover a write_token on a new IP (free)
+ *   - regenerateRecovery(writeToken) -> Issue a new recovery code (free)
+ *   - subscribe(agentId, writeToken, plan) -> Subscribe to a plan (x402)
+ *   - health() -> Service health check (free)
+ *   - stats() -> Global memory stats (free)
+ *   - sample() -> Free sample (store + search demo)
+ *
+ * Usage:
+ *   npx memory-agent-mcp
+ *   or: node index.js
+ *
+ * Configure with environment variables (all optional):
+ *   MEMORY_BASE_URL    (default: https://memory.node01.org)
+ *   MEMORY_PRIVATE_KEY (optional: enables paid operations beyond free tier)
+ *
+ * Free operations work without any configuration:
+ *   store, health, stats, sample, and 30 free searches/day.
+ * Paid operations (search beyond free tier, subscribe) require
+ * MEMORY_PRIVATE_KEY set to a wallet with USDC on Base.
+ */
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ErrorCode,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
+import { createWalletClient, http, parseEther } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { base } from "viem/chains";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
+
+// ============================= Config =============================
+const MEMORY_BASE_URL = process.env.MEMORY_BASE_URL || "https://memory.node01.org";
+const MEMORY_PRIVATE_KEY = process.env.MEMORY_PRIVATE_KEY;
+
+
+const HAS_WALLET = !!MEMORY_PRIVATE_KEY;
+if (!HAS_WALLET) {
+  console.error("NOTE: No MEMORY_PRIVATE_KEY set. Free operations (store, health, stats, sample, 30 free searches/day) will work. Paid operations (search after free tier, subscribe) will require a wallet.");
+}
+
+let account = null;
+if (HAS_WALLET) {
+  const privateKey = MEMORY_PRIVATE_KEY.startsWith("0x") ? MEMORY_PRIVATE_KEY : `0x${MEMORY_PRIVATE_KEY}`;
+  account = privateKeyToAccount(privateKey);
+}
+
+// ============================= x402 Payment Helper =============================
+async function payAndRetry(endpoint, body, priceUsd = "0.01") {
+  if (!HAS_WALLET) {
+    throw new Error("Payment required but no wallet configured. Set MEMORY_PRIVATE_KEY env var to enable paid operations. Free tier: 30 searches/day.");
+  }
+  const walletClient = createWalletClient({
+    account,
+    chain: base,
+    transport: http(),
+  });
+
+  // First call to get 402
+  const response = await fetch(`${MEMORY_BASE_URL}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (response.status !== 402) {
+    const data = await response.json();
+    return { data, status: response.status };
+  }
+
+  const paymentRequired = await response.json();
+  const accepts = paymentRequired.accepts || [];
+  const exactOption = accepts.find(
+    (a) => a.scheme === "exact" && a.network === "eip155:8453"
+  );
+
+  if (!exactOption) {
+    throw new Error("No exact payment option for Base network found");
+  }
+
+  const facilitatorUrl = paymentRequired.extensions?.["pay-with-x"]?.facilitator || "https://facilitator.payai.network";
+
+  const paymentPayload = {
+    x402Version: paymentRequired.x402Version || 2,
+    scheme: "exact",
+    network: "eip155:8453",
+    payload: {
+      authorization: {
+        from: account.address,
+        to: exactOption.payTo,
+        value: priceUsd,
+        validAfter: Math.floor(Date.now() / 1000),
+        validBefore: Math.floor(Date.now() / 1000) + 300,
+        nonce: Math.floor(Math.random() * 1000000),
+      },
+    },
+  };
+
+  const signature = await walletClient.signTypedData({
+    domain: {
+      name: "x402 Payment",
+      version: "1",
+      chainId: 8453,
+      verifyingContract: exactOption.payTo,
+    },
+    types: {
+      ExactPayment: [
+        { name: "from", type: "address" },
+        { name: "to", type: "address" },
+        { name: "value", type: "uint256" },
+        { name: "validAfter", type: "uint256" },
+        { name: "validBefore", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+      ],
+    },
+    primaryType: "ExactPayment",
+    message: {
+      from: account.address,
+      to: exactOption.payTo,
+      value: priceUsd,
+      validAfter: Math.floor(Date.now() / 1000),
+      validBefore: Math.floor(Date.now() / 1000) + 300,
+      nonce: Math.floor(Math.random() * 1000000),
+    },
+  });
+
+  paymentPayload.payload.authorization.signature = signature;
+
+  const settleResponse = await fetch(`${facilitatorUrl}/settle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(paymentPayload),
+  });
+
+  if (!settleResponse.ok) {
+    const err = await settleResponse.text();
+    throw new Error(`Payment settlement failed: ${settleResponse.status} ${err}`);
+  }
+
+  const settleResult = await settleResponse.json();
+  const paymentHeader = settleResult.paymentHeader || settleResult.header || settleResult.payment;
+
+  // Retry with payment header
+  const finalResponse = await fetch(`${MEMORY_BASE_URL}${endpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "X-Payment": paymentHeader,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await finalResponse.json();
+  return { data, status: finalResponse.status };
+}
+
+// ============================= Free API Calls =============================
+async function callFree(endpoint, method = "GET", body = null) {
+  const opts = { method, headers: { "Accept": "application/json" } };
+  if (body) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const response = await fetch(`${MEMORY_BASE_URL}${endpoint}`, opts);
+  return { data: await response.json(), status: response.status };
+}
+
+// ============================= MCP Server =============================
+const server = new Server(
+  { name: "memory-agent-mcp", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: "store",
+        description: "Store a memory (free). First call returns a write_token and recovery_code — save both! All future operations require the write_token. Re-storing with the same key updates in place (upsert). Supports base:true for small (2KB) contextual memories.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier" },
+            key: { type: "string", description: "Memory key (max 256 chars)" },
+            value: { type: "string", description: "Memory value (max 10KB)" },
+            writeToken: { type: "string", description: "Write token from first store (omit on first call)" },
+            sessionId: { type: "string", description: "Optional session ID to scope memories" },
+            metadata: { type: "object", description: "Optional metadata (max 2KB)" },
+            base: { type: "boolean", description: "Mark as base memory (max 2KB). Excluded from normal search unless includeBase=true." },
+          },
+          required: ["agentId", "key", "value"],
+        },
+      },
+      {
+        name: "search",
+        description: "Search memories semantically (free tier: 30/day, then $0.01 USDC). Returns matching memories with relevance scores. Supports 50+ languages, cross-lingual search. Use includeBase:true to include base memories.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier" },
+            query: { type: "string", description: "Search query (max 500 chars). Omit for session-only chronological listing." },
+            writeToken: { type: "string", description: "Write token (required)" },
+            topK: { type: "number", description: "Max results (default 10, max 50)", default: 10 },
+            sessionId: { type: "string", description: "Optional: scope to session. Omit query for chronological listing." },
+            cursor: { type: "string", description: "Pagination cursor from previous response" },
+            includeBase: { type: "boolean", description: "Include searchable base memories in results (default false)" },
+          },
+          required: ["agentId", "writeToken"],
+        },
+      },
+      {
+        name: "subscribe",
+        description: "Subscribe to a memory plan (x402). Starter: $2/500 credits. Pro: $9/mo unlimited. Enterprise: $20/mo unlimited+priority.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier" },
+            writeToken: { type: "string", description: "Write token (required)" },
+            plan: { type: "string", enum: ["starter", "pro", "enterprise"], description: "Plan to subscribe to" },
+          },
+          required: ["agentId", "writeToken", "plan"],
+        },
+      },
+      {
+        name: "health",
+        description: "Check Memory01 service health (free). Returns service status, free tier info, plans.",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "stats",
+        description: "Get global memory statistics (free). Returns total agents, entries, searches.",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "sample",
+        description: "Get a free sample: store a demo memory and search it. Shows the shape of responses without paying.",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "bootstrap",
+        description: "Initialize conventional base memories (credentials-location, user-preferences, user-details, code-style) if missing. Idempotent. Free.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier" },
+            writeToken: { type: "string", description: "Write token (required)" },
+            keys: { type: "array", items: { type: "string" }, description: "Optional list of base keys to create (defaults to all conventional)" },
+          },
+          required: ["agentId", "writeToken"],
+        },
+      },
+      {
+        name: "get",
+        description: "Retrieve a single memory by key (free). Useful for sensitive base memories like credentials-location.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier" },
+            writeToken: { type: "string", description: "Write token (required)" },
+            key: { type: "string", description: "Memory key to retrieve" },
+          },
+          required: ["agentId", "writeToken", "key"],
+        },
+      },
+      {
+        name: "init",
+        description: "Initialize Memory01 for this agent in one call: creates a write_token (first store), saves token+recovery_code to standard files (~/.memory01_token, ~/.memory01_recovery, chmod 600), bootstraps conventional base memories, and stores a credentials-location pointer. Returns full guide. Call once per agent; idempotent-ish (if token exists, pass writeToken).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier (required)" },
+            writeToken: { type: "string", description: "Existing write token (omit on first run)" },
+            key: { type: "string", description: "Optional first memory key (default: 'init')" },
+            value: { type: "string", description: "Optional first memory value" },
+          },
+          required: ["agentId"],
+        },
+      },
+      {
+        name: "guide",
+        description: "Get a concise guide on how to use Memory01: init flow, base memories, recovery, upsert, limits. Call this first if unsure. Full guide: https://memory.node01.org/agents.md",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "recover",
+        description: "Recover a write_token on a new IP using a recovery code (free). Use when your host's IP changed.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", description: "Your agent identifier" },
+            recoveryCode: { type: "string", description: "Recovery code (rc_...) issued at first store" },
+          },
+          required: ["agentId", "recoveryCode"],
+        },
+      },
+      {
+        name: "regenerate_recovery",
+        description: "Issue a new recovery code (invalidates the old one). Requires the original write_token from the original IP. Free.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            writeToken: { type: "string", description: "Write token from the original IP (required)" },
+          },
+          required: ["writeToken"],
+        },
+      },
+    ],
+  };
+});
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    switch (name) {
+      case "store": {
+        const { agentId, key, value, writeToken, sessionId, metadata, base } = args;
+        if (!agentId || !key || !value) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId, key, and value are required");
+        }
+        if (key.length > 256) throw new McpError(ErrorCode.InvalidParams, "key max 256 chars");
+        const valueLimit = (args.base ? 2048 : 51200);
+        if (value.length > valueLimit) throw new McpError(ErrorCode.InvalidParams, `value max ${args.base ? '2KB (base)' : '50KB'}`);
+        if (metadata && JSON.stringify(metadata).length > 2048) throw new McpError(ErrorCode.InvalidParams, "metadata max 2KB");
+
+        const body = { agent_id: agentId, key, value };
+        if (writeToken) body.write_token = writeToken;
+        if (base) body.base = true;
+        if (sessionId) body.session_id = sessionId;
+        if (metadata) body.metadata = metadata;
+
+        const result = await callFree("/api/memory/store", "POST", body);
+        if (result.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
+        }
+
+        const r = result.data;
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: r.ok,
+              stored: r.stored,
+              write_token: r.write_token,
+              message: r.message,
+              key: r.key,
+              stored_at: r.stored_at,
+              updated_at: r.updated_at,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "search": {
+        const { agentId, query, writeToken, topK = 10, sessionId, cursor, includeBase } = args;
+        if (!agentId || !writeToken) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId and writeToken are required");
+        }
+        if (query && query.length > 500) throw new McpError(ErrorCode.InvalidParams, "query max 500 chars");
+
+        const body = { agent_id: agentId, write_token: writeToken, top_k: topK };
+        if (query) body.query = query;
+        if (sessionId) body.session_id = sessionId;
+        if (cursor) body.cursor = cursor;
+        if (includeBase) body.include_base = true;
+
+        // Try free first
+        const freeResult = await callFree("/api/memory/search", "POST", body);
+
+        if (freeResult.status === 402) {
+          // Free tier exhausted, pay
+          const paidResult = await payAndRetry("/api/memory/search", body, "0.01");
+          if (paidResult.status >= 400) {
+            throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(paidResult.data)}`);
+          }
+          const r = paidResult.data;
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                results: r.results,
+                free_tier: r.free_tier,
+                tier: r.tier,
+                searched_at: r.searched_at,
+                next_cursor: r.next_cursor,
+                cursor_expires_in: r.cursor_expires_in,
+              }, null, 2),
+            }],
+          };
+        }
+
+        if (freeResult.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(freeResult.data)}`);
+        }
+
+        const r = freeResult.data;
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              results: r.results,
+              free_tier: r.free_tier,
+              tier: r.tier,
+              searched_at: r.searched_at,
+              next_cursor: r.next_cursor,
+              cursor_expires_in: r.cursor_expires_in,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "subscribe": {
+        const { agentId, writeToken, plan } = args;
+        if (!agentId || !writeToken || !plan) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId, writeToken, and plan are required");
+        }
+
+        const body = { agent_id: agentId, write_token: writeToken, plan };
+        const priceMap = { starter: "2.00", pro: "9.00", enterprise: "20.00" };
+        const paidResult = await payAndRetry("/api/memory/subscribe", body, priceMap[plan] || "2.00");
+
+        if (paidResult.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(paidResult.data)}`);
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(paidResult.data, null, 2),
+          }],
+        };
+      }
+
+      case "health": {
+        const result = await callFree("/api/health");
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }],
+        };
+      }
+
+      case "stats": {
+        const result = await callFree("/api/memory/stats");
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }],
+        };
+      }
+
+      case "sample": {
+        // Store a demo memory, then search it
+        const storeResult = await callFree("/api/memory/store", "POST", {
+          agent_id: "sample-agent",
+          key: "demo",
+          value: "This is a sample memory for testing Memory01 service",
+        });
+
+        const searchResult = await callFree("/api/memory/search", "POST", {
+          agent_id: "sample-agent",
+          write_token: storeResult.data.write_token,
+          query: "sample memory",
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              store: storeResult.data,
+              search: searchResult.data,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "bootstrap": {
+        const { agentId, writeToken, keys } = args;
+        if (!agentId || !writeToken) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId and writeToken are required");
+        }
+        const body = { agent_id: agentId, write_token: writeToken };
+        if (keys) body.keys = keys;
+        const result = await callFree("/api/memory/bootstrap", "POST", body);
+        if (result.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
+        }
+        return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+      }
+
+      case "get": {
+        const { agentId, writeToken, key } = args;
+        if (!agentId || !writeToken || !key) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId, writeToken, and key are required");
+        }
+        const result = await callFree("/api/memory/get", "POST", { agent_id: agentId, write_token: writeToken, key });
+        if (result.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
+        }
+        return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+      }
+
+      case "init": {
+        const { agentId, writeToken: providedToken, key = "init", value = "Memory01 initialized." } = args;
+        if (!agentId) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId is required");
+        }
+
+        const home = os.homedir();
+        const tokenFile = path.join(home, ".memory01_token");
+        const recoveryFile = path.join(home, ".memory01_recovery");
+
+        // Step 1: get or create token
+        let token = providedToken;
+        let recoveryCode = null;
+        let isNew = false;
+        let storeResult = null;
+
+        if (!token) {
+          const r = await callFree("/api/memory/store", "POST", { agent_id: agentId, key, value });
+          if (r.status === 403 && r.data && r.data.error === "token_required") {
+            throw new McpError(ErrorCode.InvalidParams, "A token already exists for this (IP, agent_id). Pass writeToken to init, or use recover if your IP changed.");
+          }
+          if (r.status >= 400) {
+            throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(r.data)}`);
+          }
+          token = r.data.write_token;
+          recoveryCode = r.data.recovery_code;
+          isNew = true;
+          storeResult = r.data;
+        }
+
+        // Step 2: write credential files (chmod 600)
+        const savedFiles = [];
+        if (isNew && token) {
+          try {
+            fs.writeFileSync(tokenFile, token + "\n", { mode: 0o600 });
+            savedFiles.push(tokenFile);
+          } catch (e) {
+            console.error("Could not write token file:", e);
+          }
+        }
+        if (isNew && recoveryCode) {
+          try {
+            fs.writeFileSync(recoveryFile, recoveryCode + "\n", { mode: 0o600 });
+            savedFiles.push(recoveryFile);
+          } catch (e) {
+            console.error("Could not write recovery file:", e);
+          }
+        }
+
+        // Step 3: bootstrap base memories (idempotent)
+        const bootstrapResult = await callFree("/api/memory/bootstrap", "POST", { agent_id: agentId, write_token: token });
+
+        // Step 4: upsert credentials-location base memory pointing to the files
+        const credValue = `Token at ${tokenFile}, recovery at ${recoveryFile} (chmod 600). Do not store secrets in memory.`;
+        await callFree("/api/memory/store", "POST", { agent_id: agentId, write_token: token, key: "credentials-location", value: credValue, base: true });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              new_token: isNew,
+              write_token: token,
+              recovery_code: recoveryCode,
+              credential_files: savedFiles,
+              bootstrap: bootstrapResult.data,
+              guide: {
+                init_done: "Memory01 initialized. Token and recovery code saved to standard files (chmod 600). Base memories bootstrapped. credentials-location base memory stored.",
+                next_steps: [
+                  "Use store(key, value) to save memories. Re-store with same key to update (upsert).",
+                  "Use search(query) for semantic search (free: 30/day). Use includeBase:true to load context at session start.",
+                  "Recovery: if your IP changes, call recover(agentId, recoveryCode) from the new host.",
+                  "Regenerate recovery code from original IP with regenerate_recovery(writeToken) if lost.",
+                  "Full guide: https://memory.node01.org/agents.md",
+                ],
+                standard_paths: { token: tokenFile, recovery: recoveryFile },
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "guide": {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              init: "1) store a memory with agentId+key+value (omit writeToken on first call). 2) Save write_token AND recovery_code to ~/.memory01_token and ~/.memory01_recovery (chmod 600). 3) Store a base memory key='credentials-location' pointing to those files. 4) Use bootstrap to create conventional base memories.",
+              tools: ["store", "search", "bootstrap", "get", "recover", "regenerate_recovery", "subscribe", "health", "stats", "sample", "guide"],
+              base_memories: "Small (max 2KB) contextual memories. Excluded from normal search by default. Use includeBase:true to load them (e.g. at session start). Conventional keys: credentials-location (sensitive), user-preferences, user-details, code-style.",
+              recovery: "Token bound to (IP, agent_id). If IP changes, use recover(agentId, recoveryCode) to get a new token. Regenerate recovery code from original IP if lost. Save recovery_code offline.",
+              upsert: "Re-store with the same key updates in place (no duplicates). updated_at refreshed, stored_at preserved.",
+              limits: "key max 256, value max 50KB (2KB for base), metadata max 2KB, session_id max 128, top_k 1-20. Free: 30 searches/day, then $0.01 USDC.",
+              full_guide: "https://memory.node01.org/agents.md",
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "recover": {
+        const { agentId, recoveryCode } = args;
+        if (!agentId || !recoveryCode) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId and recoveryCode are required");
+        }
+        const result = await callFree("/api/memory/recover", "POST", { agent_id: agentId, recovery_code: recoveryCode });
+        if (result.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
+        }
+        return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+      }
+
+      case "regenerate_recovery": {
+        const { writeToken } = args;
+        if (!writeToken) {
+          throw new McpError(ErrorCode.InvalidParams, "writeToken is required");
+        }
+        const result = await callFree("/api/memory/recovery/regenerate", "POST", { write_token: writeToken });
+        if (result.status >= 400) {
+          throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
+        }
+        return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+      }
+
+      default:
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    if (error instanceof McpError) throw error;
+    console.error(`Tool ${name} error:`, error);
+    throw new McpError(ErrorCode.InternalError, String(error));
+  }
+});
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("memory-agent-mcp running on stdio");
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
