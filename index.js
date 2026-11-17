@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * memory-agent-mcp — MCP stdio server for Memory01 agentic memory service
+ * mem-mcp — MCP stdio server for Memory01 agentic memory service
  *
  * Provides tools to interact with the Memory01 API:
  *   - store(agentId, key, value, writeToken?, sessionId?, metadata?, base?) -> Store a memory (free; base=true for 2KB contextual memories)
@@ -15,7 +15,7 @@
  *   - sample() -> Free sample (store + search demo)
  *
  * Usage:
- *   npx memory-agent-mcp
+ *   npx mem-mcp
  *   or: node index.js
  *
  * Configure with environment variables (all optional):
@@ -45,12 +45,30 @@ import fs from "node:fs";
 
 // ============================= Config =============================
 const MEMORY_BASE_URL = process.env.MEMORY_BASE_URL || "https://memory.node01.org";
+const CLIENT_VERSION = "1.3.6";
+// USDC on Base has 6 decimals: $0.01 -> 10000 base units (string for viem/bigint safety)
+function usdcUnits(usdStr) {
+  const v = parseFloat(usdStr);
+  return Math.round(v * 1_000_000).toString();
+}
 const MEMORY_PRIVATE_KEY = process.env.MEMORY_PRIVATE_KEY;
 
 
 const HAS_WALLET = !!MEMORY_PRIVATE_KEY;
 if (!HAS_WALLET) {
   console.error("NOTE: No MEMORY_PRIVATE_KEY set. Free operations (store, health, stats, sample, 30 free searches/day) will work. Paid operations (search after free tier, subscribe) will require a wallet.");
+}
+
+// ============================= Credential File Helper =============================
+function readTokenFile() {
+  try {
+    const home = os.homedir();
+    const p = path.join(home, ".memory01_token");
+    if (fs.existsSync(p)) {
+      return fs.readFileSync(p, "utf8").trim();
+    }
+  } catch (e) {}
+  return null;
 }
 
 let account = null;
@@ -102,7 +120,7 @@ async function payAndRetry(endpoint, body, priceUsd = "0.01") {
       authorization: {
         from: account.address,
         to: exactOption.payTo,
-        value: priceUsd,
+        value: usdcUnits(priceUsd),
         validAfter: Math.floor(Date.now() / 1000),
         validBefore: Math.floor(Date.now() / 1000) + 300,
         nonce: Math.floor(Math.random() * 1000000),
@@ -131,7 +149,7 @@ async function payAndRetry(endpoint, body, priceUsd = "0.01") {
     message: {
       from: account.address,
       to: exactOption.payTo,
-      value: priceUsd,
+      value: usdcUnits(priceUsd),
       validAfter: Math.floor(Date.now() / 1000),
       validBefore: Math.floor(Date.now() / 1000) + 300,
       nonce: Math.floor(Math.random() * 1000000),
@@ -170,19 +188,32 @@ async function payAndRetry(endpoint, body, priceUsd = "0.01") {
 }
 
 // ============================= Free API Calls =============================
-async function callFree(endpoint, method = "GET", body = null) {
-  const opts = { method, headers: { "Accept": "application/json" } };
-  if (body) {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = JSON.stringify(body);
+async function callFree(endpoint, method = "GET", body = null, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const opts = { method, headers: { "Accept": "application/json" } };
+    if (body) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    try {
+      const response = await fetch(`${MEMORY_BASE_URL}${endpoint}`, opts);
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch (e) {
+        if (attempt < retries) { await new Promise(r => setTimeout(r, 500)); continue; }
+        throw new Error(`Non-JSON response from ${endpoint}: ${text.substring(0, 200)}`);
+      }
+      return { data, status: response.status };
+    } catch (e) {
+      if (attempt < retries) { await new Promise(r => setTimeout(r, 500)); continue; }
+      throw e;
+    }
   }
-  const response = await fetch(`${MEMORY_BASE_URL}${endpoint}`, opts);
-  return { data: await response.json(), status: response.status };
 }
 
 // ============================= MCP Server =============================
 const server = new Server(
-  { name: "memory-agent-mcp", version: "1.0.0" },
+  { name: "mem-mcp", version: "1.3.7" },
   { capabilities: { tools: {} } }
 );
 
@@ -329,16 +360,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "store": {
-        const { agentId, key, value, writeToken, sessionId, metadata, base } = args;
-        if (!agentId || !key || !value) {
-          throw new McpError(ErrorCode.InvalidParams, "agentId, key, and value are required");
+        let { agentId, key, value, writeToken, sessionId, metadata, base } = args;
+        if (!writeToken) writeToken = readTokenFile();
+        if (!agentId && !writeToken) {
+          throw new McpError(ErrorCode.InvalidParams, "agentId is required on first store (no writeToken found). Pass agentId or set ~/.memory01_token.");
         }
+        if (!key || !value) {
+          throw new McpError(ErrorCode.InvalidParams, "key and value are required");
+        }
+        if (!agentId) agentId = "agent";
         if (key.length > 256) throw new McpError(ErrorCode.InvalidParams, "key max 256 chars");
         const valueLimit = (args.base ? 2048 : 51200);
         if (value.length > valueLimit) throw new McpError(ErrorCode.InvalidParams, `value max ${args.base ? '2KB (base)' : '50KB'}`);
         if (metadata && JSON.stringify(metadata).length > 2048) throw new McpError(ErrorCode.InvalidParams, "metadata max 2KB");
 
-        const body = { agent_id: agentId, key, value };
+        const body = { agent_id: agentId, key, value, client_version: CLIENT_VERSION };
         if (writeToken) body.write_token = writeToken;
         if (base) body.base = true;
         if (sessionId) body.session_id = sessionId;
@@ -361,19 +397,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               key: r.key,
               stored_at: r.stored_at,
               updated_at: r.updated_at,
+              update_hint: r.update_hint,
             }, null, 2),
           }],
         };
       }
 
       case "search": {
-        const { agentId, query, writeToken, topK = 10, sessionId, cursor, includeBase } = args;
-        if (!agentId || !writeToken) {
-          throw new McpError(ErrorCode.InvalidParams, "agentId and writeToken are required");
+        let { agentId, query, writeToken, topK = 10, sessionId, cursor, includeBase } = args;
+        if (!writeToken) writeToken = readTokenFile();
+        if (!writeToken) {
+          throw new McpError(ErrorCode.InvalidParams, "writeToken is required (or set ~/.memory01_token).");
         }
+        if (!agentId) agentId = "agent";
         if (query && query.length > 500) throw new McpError(ErrorCode.InvalidParams, "query max 500 chars");
 
-        const body = { agent_id: agentId, write_token: writeToken, top_k: topK };
+        const body = { agent_id: agentId, write_token: writeToken, top_k: topK, client_version: CLIENT_VERSION };
         if (query) body.query = query;
         if (sessionId) body.session_id = sessionId;
         if (cursor) body.cursor = cursor;
@@ -399,6 +438,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 searched_at: r.searched_at,
                 next_cursor: r.next_cursor,
                 cursor_expires_in: r.cursor_expires_in,
+                update_hint: r.update_hint,
               }, null, 2),
             }],
           };
@@ -419,6 +459,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               searched_at: r.searched_at,
               next_cursor: r.next_cursor,
               cursor_expires_in: r.cursor_expires_in,
+              update_hint: r.update_hint,
             }, null, 2),
           }],
         };
@@ -430,7 +471,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new McpError(ErrorCode.InvalidParams, "agentId, writeToken, and plan are required");
         }
 
-        const body = { agent_id: agentId, write_token: writeToken, plan };
+        const body = { agent_id: agentId, write_token: writeToken, plan, client_version: CLIENT_VERSION };
         const priceMap = { starter: "2.00", pro: "9.00", enterprise: "20.00" };
         const paidResult = await payAndRetry("/api/memory/subscribe", body, priceMap[plan] || "2.00");
 
@@ -486,11 +527,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "bootstrap": {
-        const { agentId, writeToken, keys } = args;
-        if (!agentId || !writeToken) {
-          throw new McpError(ErrorCode.InvalidParams, "agentId and writeToken are required");
+        let { agentId, writeToken, keys } = args;
+        if (!writeToken) writeToken = readTokenFile();
+        if (!writeToken) {
+          throw new McpError(ErrorCode.InvalidParams, "writeToken is required (or set ~/.memory01_token).");
         }
-        const body = { agent_id: agentId, write_token: writeToken };
+        if (!agentId) agentId = "agent";
+        const body = { agent_id: agentId, write_token: writeToken, client_version: CLIENT_VERSION };
         if (keys) body.keys = keys;
         const result = await callFree("/api/memory/bootstrap", "POST", body);
         if (result.status >= 400) {
@@ -500,11 +543,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get": {
-        const { agentId, writeToken, key } = args;
-        if (!agentId || !writeToken || !key) {
-          throw new McpError(ErrorCode.InvalidParams, "agentId, writeToken, and key are required");
+        let { agentId, writeToken, key } = args;
+        if (!writeToken) writeToken = readTokenFile();
+        if (!writeToken || !key) {
+          throw new McpError(ErrorCode.InvalidParams, "writeToken and key are required");
         }
-        const result = await callFree("/api/memory/get", "POST", { agent_id: agentId, write_token: writeToken, key });
+        if (!agentId) agentId = "agent";
+        const result = await callFree("/api/memory/get", "POST", { agent_id: agentId, write_token: writeToken, key, client_version: CLIENT_VERSION });
         if (result.status >= 400) {
           throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
         }
@@ -512,7 +557,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "init": {
-        const { agentId, writeToken: providedToken, key = "init", value = "Memory01 initialized." } = args;
+        let { agentId, writeToken: providedToken, key = "init", value = "Memory01 initialized." } = args;
+        if (!providedToken) providedToken = readTokenFile();
         if (!agentId) {
           throw new McpError(ErrorCode.InvalidParams, "agentId is required");
         }
@@ -528,7 +574,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let storeResult = null;
 
         if (!token) {
-          const r = await callFree("/api/memory/store", "POST", { agent_id: agentId, key, value });
+          const r = await callFree("/api/memory/store", "POST", { agent_id: agentId, key, value, client_version: CLIENT_VERSION });
           if (r.status === 403 && r.data && r.data.error === "token_required") {
             throw new McpError(ErrorCode.InvalidParams, "A token already exists for this (IP, agent_id). Pass writeToken to init, or use recover if your IP changed.");
           }
@@ -561,11 +607,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Step 3: bootstrap base memories (idempotent)
-        const bootstrapResult = await callFree("/api/memory/bootstrap", "POST", { agent_id: agentId, write_token: token });
+        const bootstrapResult = await callFree("/api/memory/bootstrap", "POST", { agent_id: agentId, write_token: token, client_version: CLIENT_VERSION });
 
         // Step 4: upsert credentials-location base memory pointing to the files
         const credValue = `Token at ${tokenFile}, recovery at ${recoveryFile} (chmod 600). Do not store secrets in memory.`;
-        await callFree("/api/memory/store", "POST", { agent_id: agentId, write_token: token, key: "credentials-location", value: credValue, base: true });
+        await callFree("/api/memory/store", "POST", { agent_id: agentId, write_token: token, key: "credentials-location", value: credValue, base: true, client_version: CLIENT_VERSION });
 
         return {
           content: [{
@@ -577,9 +623,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               recovery_code: recoveryCode,
               credential_files: savedFiles,
               bootstrap: bootstrapResult.data,
+              update_hint: storeResult && storeResult.update_hint,
               guide: {
                 init_done: "Memory01 initialized. Token and recovery code saved to standard files (chmod 600). Base memories bootstrapped. credentials-location base memory stored.",
-                next_steps: [
+                best_practices: [
+                  "Save write_token to ~/.memory01_token and recovery_code to ~/.memory01_recovery (chmod 600). Never store secrets in memory.",
+                  "Use upsert: re-store with the same key updates in place.",
+                  "Base memories (max 2KB) for context; use includeBase:true to load at session start.",
+                  "Bootstrap conventional keys: credentials-location (sensitive), user-preferences, user-details, code-style.",
+                  "Recovery: if IP changes, use recover(agentId, recoveryCode).",
+                  "Free tier: 30 searches/day, then $0.01 USDC. Store is always free.",
+              ],
+              next_steps: [
                   "Use store(key, value) to save memories. Re-store with same key to update (upsert).",
                   "Use search(query) for semantic search (free: 30/day). Use includeBase:true to load context at session start.",
                   "Recovery: if your IP changes, call recover(agentId, recoveryCode) from the new host.",
@@ -604,6 +659,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               recovery: "Token bound to (IP, agent_id). If IP changes, use recover(agentId, recoveryCode) to get a new token. Regenerate recovery code from original IP if lost. Save recovery_code offline.",
               upsert: "Re-store with the same key updates in place (no duplicates). updated_at refreshed, stored_at preserved.",
               limits: "key max 256, value max 50KB (2KB for base), metadata max 2KB, session_id max 128, top_k 1-20. Free: 30 searches/day, then $0.01 USDC.",
+              best_practices: [
+                "Save write_token to ~/.memory01_token and recovery_code to ~/.memory01_recovery (chmod 600). Never store secrets in memory.",
+                "Use upsert: re-store with the same key updates in place.",
+                "Base memories (max 2KB) for context; excluded from normal search, includeBase=true to load at session start.",
+                "Bootstrap conventional keys: credentials-location (sensitive), user-preferences, user-details, code-style.",
+                "Recovery: if IP changes, use recover(agentId, recoveryCode). Regenerate from original IP if lost.",
+                "Free tier: 30 searches/day, then $0.01 USDC. Store is always free.",
+                "Dense facts: memory is an index, not a file store.",
+                "Session scoping: use sessionId to scope to a project.",
+              ],
               full_guide: "https://memory.node01.org/agents.md",
             }, null, 2),
           }],
@@ -615,7 +680,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!agentId || !recoveryCode) {
           throw new McpError(ErrorCode.InvalidParams, "agentId and recoveryCode are required");
         }
-        const result = await callFree("/api/memory/recover", "POST", { agent_id: agentId, recovery_code: recoveryCode });
+        const result = await callFree("/api/memory/recover", "POST", { agent_id: agentId, recovery_code: recoveryCode, client_version: CLIENT_VERSION });
         if (result.status >= 400) {
           throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
         }
@@ -623,11 +688,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "regenerate_recovery": {
-        const { writeToken } = args;
+        let { writeToken } = args;
+        if (!writeToken) writeToken = readTokenFile();
         if (!writeToken) {
           throw new McpError(ErrorCode.InvalidParams, "writeToken is required");
         }
-        const result = await callFree("/api/memory/recovery/regenerate", "POST", { write_token: writeToken });
+        const result = await callFree("/api/memory/recovery/regenerate", "POST", { write_token: writeToken, client_version: CLIENT_VERSION });
         if (result.status >= 400) {
           throw new McpError(ErrorCode.InternalError, `API error: ${JSON.stringify(result.data)}`);
         }
@@ -644,10 +710,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+// ============================= Version Check =============================
+async function checkLatestVersion() {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch("https://registry.npmjs.org/mem-mcp/latest", { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return;
+    const data = await res.json();
+    const latest = data.version;
+    const current = "1.3.6";
+    if (latest && latest !== current) {
+      console.error(`NOTE: mem-mcp ${current} is installed; latest is ${latest}. Run 'npm install -g mem-mcp@latest' to update.`);
+    }
+  } catch (e) {
+    // best-effort, ignore
+  }
+}
+
 async function main() {
+  checkLatestVersion(); // best-effort, non-blocking
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("memory-agent-mcp running on stdio");
+  console.error("mem-mcp running on stdio");
 }
 
 main().catch((err) => {

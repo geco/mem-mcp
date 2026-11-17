@@ -1,4 +1,4 @@
-# memory-agent-mcp
+# mem-mcp
 
 MCP wrapper for [Memory01](https://memory.node01.org) — agentic memory for AI agents.
 
@@ -12,18 +12,26 @@ MCP wrapper for [Memory01](https://memory.node01.org) — agentic memory for AI 
 - **Subscribe**: Subscription plans (Starter $2/500, Pro $9/mo, Enterprise $20/mo)
 - **Health / Stats / Sample**: Free utilities
 
+## Auto-update
+
+MCP clients do not auto-update servers. To always use the latest version:
+
+- **Recommended config**: use `npx -y mem-mcp@latest` in your MCP config. npx checks the registry on each launch (cached, fast).
+- **Global install**: run `npm install -g mem-mcp@latest` periodically, or `npm update -g mem-mcp`. Use the `mem-mcp` binary in your MCP config for offline startup.
+- The server prints a note on startup if a newer version is available.
+
 ## One-command setup
 
 After installing, tell your agent:
 
-> Install `memory-agent-mcp` and call the `init` tool with your agentId. It will set everything up and explain the rest.
+> Install `mem-mcp` and call the `init` tool with your agentId. It will set everything up and explain the rest.
 
 The `init` tool creates the token, saves credentials to `~/.memory01_token` / `~/.memory01_recovery` (chmod 600), bootstraps base memories, and returns a full guide.
 
 ## Installation
 
 ```bash
-npm install -g memory-agent-mcp
+npm install -g mem-mcp
 ```
 
 ## Configuration
@@ -80,17 +88,36 @@ Read the agent-facing guide first: https://memory.node01.org/agents.md
 Add to your `opencode.json`:
 
 ```json
+// Option A — global install (offline, fast, no network):
 {
   "mcp": {
     "memory": {
       "type": "local",
-      "command": ["npx", "-y", "memory-agent-mcp"],
+      "command": ["mem-mcp"],
       "environment": {
         "MEMORY_PRIVATE_KEY": "0x..."
       }
     }
   }
 }
+
+// Option B — always latest (checks registry on launch):
+{
+  "mcp": {
+    "memory": {
+      "type": "local",
+      "command": ["npx", "-y", "mem-mcp@latest"],
+      "environment": {
+        "MEMORY_PRIVATE_KEY": "0x..."
+      }
+    }
+  }
+}
+```
+
+Note: the binary is `mem-mcp`. Use `mem-mcp` if globally installed,
+`npx -y mem-mcp@latest` otherwise. MEMORY_PRIVATE_KEY is optional —
+the free tier (store + 30 searches/day + bootstrap + get) works without it.
 ```
 
 ## Tools
