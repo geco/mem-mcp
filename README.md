@@ -120,6 +120,43 @@ Note: the binary is `mem-mcp`. Use `mem-mcp` if globally installed,
 the free tier (store + 30 searches/day + bootstrap + get) works without it.
 ```
 
+## Quick Start
+
+### OpenCode (`~/.config/opencode/opencode.json`)
+```json
+{
+  "mcp": {
+    "memory": {
+      "type": "local",
+      "command": ["npx", "-y", "mem-mcp@latest"],
+      "environment": { "MEMORY_PRIVATE_KEY": "0x..." }
+    }
+  }
+}
+```
+
+### Claude Desktop (`claude_desktop_config.json`)
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "mem-mcp@latest"],
+      "env": { "MEMORY_PRIVATE_KEY": "0x..." }
+    }
+  }
+}
+```
+
+### Cursor / Windsurf / freebuff
+Same config as Claude Desktop — just paste into your MCP settings.
+
+### Global install (offline startup)
+```bash
+npm install -g mem-mcp@latest
+```
+Then use `"command": ["mem-mcp"]` in your MCP config.
+
 ## Tools
 
 ### init
