@@ -45,7 +45,7 @@ import fs from "node:fs";
 
 // ============================= Config =============================
 const MEMORY_BASE_URL = process.env.MEMORY_BASE_URL || "https://memory.node01.org";
-const CLIENT_VERSION = "1.3.6";
+const CLIENT_VERSION = "1.3.11";
 // USDC on Base has 6 decimals: $0.01 -> 10000 base units (string for viem/bigint safety)
 function usdcUnits(usdStr) {
   const v = parseFloat(usdStr);
@@ -213,7 +213,7 @@ async function callFree(endpoint, method = "GET", body = null, retries = 1) {
 
 // ============================= MCP Server =============================
 const server = new Server(
-  { name: "mem-mcp", version: "1.3.10" },
+  { name: "mem-mcp", version: "1.3.11" },
   { capabilities: { tools: {} } }
 );
 
@@ -720,7 +720,7 @@ async function checkLatestVersion() {
     if (!res.ok) return;
     const data = await res.json();
     const latest = data.version;
-    const current = "1.3.6";
+    const current = "1.3.11";
     if (latest && latest !== current) {
       console.error(`NOTE: mem-mcp ${current} is installed; latest is ${latest}. Run 'npm install -g mem-mcp@latest' to update.`);
     }
