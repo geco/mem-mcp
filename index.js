@@ -729,11 +729,39 @@ async function checkLatestVersion() {
   }
 }
 
+// CLI flags
+const args = process.argv.slice(2);
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(`mem-mcp ${"1.3.11"} — MCP stdio server for Memory01 agentic memory service
+
+Usage:
+  mem-mcp                 Start the MCP server on stdio (default). Waits for
+                          JSON-RPC messages from an MCP client (Claude, Cursor,
+                          OpenCode, etc.). It does NOT read from the terminal:
+                          stdin must be a pipe from an MCP host. Launching it
+                          by hand will just hang waiting for input — that is
+                          normal, press Ctrl+C to exit.
+  mem-mcp --help, -h      Show this help and exit.
+  mem-mcp --version, -v   Print the version and exit.
+
+Environment (all optional):
+  MEMORY_BASE_URL        default https://memory.node01.org
+  MEMORY_PRIVATE_KEY     wallet key for paid operations (search beyond free
+                         tier, subscribe). Free tier works without it.
+
+Docs: https://github.com/geco/mem-mcp#readme`);
+  process.exit(0);
+}
+if (args.includes("--version") || args.includes("-v")) {
+  console.log("1.3.11");
+  process.exit(0);
+}
+
 async function main() {
   checkLatestVersion(); // best-effort, non-blocking
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("mem-mcp running on stdio");
+  console.error("mem-mcp running on stdio (MCP server, waiting for JSON-RPC on stdin)");
 }
 
 main().catch((err) => {
