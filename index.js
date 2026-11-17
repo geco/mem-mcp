@@ -213,7 +213,7 @@ async function callFree(endpoint, method = "GET", body = null, retries = 1) {
 
 // ============================= MCP Server =============================
 const server = new Server(
-  { name: "mem-mcp", version: "1.3.9" },
+  { name: "mem-mcp", version: "1.3.10" },
   { capabilities: { tools: {} } }
 );
 
