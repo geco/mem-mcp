@@ -1,6 +1,6 @@
 {
   "name": "mem-mcp",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "description": "MCP wrapper for Memory01 agentic memory service - persistent memory for AI agents, free to store and search. Base memories, recovery codes, upsert, 50+ languages.",
   "type": "module",
   "main": "index.js",
@@ -34,10 +34,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/geco/memory-agent-mcp.git"
+    "url": "https://github.com/geco/mem-mcp.git"
   },
-  "homepage": "https://github.com/geco/memory-agent-mcp#readme",
+  "homepage": "https://github.com/geco/mem-mcp#readme",
   "bugs": {
-    "url": "https://github.com/geco/memory-agent-mcp/issues"
+    "url": "https://github.com/geco/mem-mcp/issues"
   }
 }
